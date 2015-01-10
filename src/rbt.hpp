@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <stdio.h>
 
-template<typename I, typename T>
+template<typename I, typename T, class Cleanup>
 struct RBNode {
 	RBNode* left;
 	RBNode* right;
@@ -11,6 +11,12 @@ struct RBNode {
 	bool color;
 	I value;
 	T payload;
+
+	void cleanup(Cleanup& c) {
+		c(payload);
+		if(left != NULL) left->cleanup(c);
+		if(right != NULL) right->cleanup(c);
+	}
 
 	~RBNode() {
 		if(left != NULL) delete left;
@@ -20,9 +26,25 @@ struct RBNode {
 	}
 };
 
-template<typename I, typename T, class Cmp=std::less<I> >
+template<typename T>
+struct no_cleanup {
+	void operator()(T r) {
+	}
+};
+
+template<typename T>
+struct delete_cleanup {
+	void operator()(T* r) {
+		delete r;
+	}
+};
+
+template<typename I, typename T, class Cleanup=no_cleanup<T>, class Cmp=std::less<I> >
 class RBTree {
-	typedef RBNode<I,T>* payload;
+public:
+	typedef RBNode<I,T,Cleanup> payloadt;
+	typedef payloadt* payload;
+private:
 	payload root;
 	Cmp cmp;
 public:
@@ -31,6 +53,8 @@ public:
 	}
 
 	~RBTree() {
+		Cleanup c;
+		if(root != NULL) root->cleanup(c);
 		delete root;
 	}
 
@@ -38,13 +62,13 @@ public:
 		return root;
 	}
 
-	void insert(I value, T payload) {
+	void insert(I value, T payload_val) {
 		// Allocate a new RBNode
-		RBNode<I,T>* newNode = new RBNode<I,T>();
+		payload newNode = new payloadt();
 		newNode->left = newNode->right = newNode->parent = NULL;
 		newNode->color = true;
 		newNode->value = value;
-		newNode->payload = payload;
+		newNode->payload = payload_val;
 
 		// Make sure the root is okay
 		if(root == NULL) {
@@ -54,7 +78,7 @@ public:
 		}
 
 		// Insert
-		RBNode<I,T>* n = root;
+		payload n = root;
 		while(true) {
 			if((!cmp(value, n->value)) && (!cmp(n->value, value))) {
 				throw std::runtime_error("Already present");

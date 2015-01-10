@@ -1,0 +1,47 @@
+ALL BINARY FIELDS ARE BIG-ENDIAN.
+
+Record stream - 'recordstream.bin':
+The record stream is a binary file that represents the meaningful contents of the
+database dump in a format that can be easily read by preprocess. It is generated
+by parse.py, which uses mwlib and lxml to parse the wikipedia XML dump and generate
+the stream. The record stream consists of a large number of record structures, one
+after the other. Each record structure represents a single page, redirect. The record
+structure consists of the length of the title as a uint16, followed by the record ID
+as a uint32, then the lower-cased page titles, with any special characters reduced to
+their ASCII equivalents. Next is the type of the record, as a byte. Type 0 is a page,
+meaning a title and a list of linked pages. Type 1 is a redirect, meaning a title and
+a target page. For pages, this is followed by the number of links as a uint32, after
+which are N strings, containing the pages being linked to. Each string is formatted
+in the same way as the title. For redirects, the type field is followed by the
+redirect target as a string.
+
+ID-Name mapping - 'id_name.bin':
+The ID-name mapping stores the mapping between page IDs and human-readable names. The
+file begins with the number of pages (N) as a uint32. After this, there are N uint32
+fields, each representing the offset of the data field for the page at position N. This
+means that the field location for page P is at offset 4*(P+1). After the data offset
+block, the main data area is stored. Each data entry consists of the name length as a
+uint16 followed by its content as characters.
+
+ID-Links mapping - 'id_links.bin':
+The ID-links mapping stores the mapping between page IDs and links, much like the ID-Name
+mapping stores the mapping between page IDs and names. It is structured identically,
+except that the data entries are different. First comes the number of links as a uint32.
+After that, the links are stored as an array of uint32s, each representing a linked
+page ID.
+
+Name-ID mapping - 'name_id.bin'
+The Name-ID mapping allows translation between page names and their IDs. It is a serialized
+binary search tree, mapping strings to uint32s. The first node read is the root of the tree,
+and from that point, nodes will be located by following embedded pointers. Each node contains
+the length of its name as a uint16, followed by the lowercase name, followed by the ID of the
+node it represents. After the name and ID comes the links to the left and right nodes. First
+is the link descriptor - a byte field that states which links the node has. LD & 1 is nonzero
+if the node has a left child, and LD & 2 is nonzero if the node has a right child. After the
+link descriptor, the child locations - left then right, are stored. If either does not exist
+for the node, then the location is not stored. The locations point to the start offsets of
+the child's node entry.
+
+Redirect mapping - 'redirects.bin'
+This is a sorted list of redirect elements. Each element is two uint32s, the first one being
+the node ID of the redirect, the second being the target.

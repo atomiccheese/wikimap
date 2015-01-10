@@ -8,6 +8,7 @@
  */
 template<class T>
 struct SynchronizedQueue {
+	typedef boost::chrono::duration<double> dsecs;
 public:
 	SynchronizedQueue() {
 	}
@@ -27,12 +28,17 @@ public:
 		return s;
 	}
 
+	size_t approxSize() {
+		return m_entry.size();
+	}
+
 	T get(float timeout=-1) {
 		if(acquire(timeout)) throw std::runtime_error("Timeout");
 		boost::unique_lock<boost::mutex> lock(m_cMutex);
 		while(m_entry.empty()) {
 			release();
-			m_cond.wait(lock);
+			if(boost::cv_status::timeout == m_cond.wait_for(lock, dsecs(timeout)))
+				throw std::runtime_error("Timeout");
 			if(acquire(timeout)) throw std::runtime_error("Timeout");
 		}
 		T out = m_entry.front();
@@ -61,7 +67,7 @@ private:
 		} else if(timeout == 0) {
 			return !m_mutex.try_lock();
 		} else {
-			return !m_mutex.try_lock_for(boost::chrono::duration<double>(timeout));
+			return !m_mutex.try_lock_for(dsecs(timeout));
 		}
 		return false;
 	}
