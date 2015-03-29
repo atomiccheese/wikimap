@@ -24,22 +24,19 @@ struct patricia_list {
 	}
 };
 
-template<typename T>
+template<typename T, typename S>
 struct patricia_node {
-	typedef patricia_list<std::string, patricia_node<T>*>* edgelist;
+	typedef patricia_list<S, patricia_node<T,S>*>* edgelist;
 	T value;
 	bool hasValue;
 	edgelist edges;
-	unsigned int nEdges;
 
 	patricia_node() : hasValue(false) {
 		edges = NULL;
-		nEdges = 0;
 	}
 
 	patricia_node(T v) : value(v), hasValue(true) {
 		edges = NULL;
-		nEdges = 0;
 	}
 
 	~patricia_node() {
@@ -58,10 +55,10 @@ struct patricia_node {
 	}
 
 	bool checkCycles() {
-		std::list<patricia_node<T>*> stack;
+		std::list<patricia_node<T,S>*> stack;
 		stack.push_back(this);
 		while(!stack.empty()) {
-			patricia_node<T>* elem = stack.back();
+			patricia_node<T,S>* elem = stack.back();
 			if(elem == NULL) continue;
 		}
 		for(edgelist i = edges;i != NULL;i = i->next) {
@@ -70,13 +67,19 @@ struct patricia_node {
 		return false;
 	}
 
-	void appendEdge(std::string s, patricia_node<T>* n) {
+	void freePtrs() {
+		delete edges;
+		edgelist i;
+		for(i=edges;i != NULL;i=i->next)
+			i->second->freePtrs();
+	}
+
+	void appendEdge(S s, patricia_node<T,S>* n) {
 		if(edges != NULL) {
 			edges->append(s,n);
 		} else {
-			edges = new patricia_list<std::string, patricia_node<T>*>(s,n);
+			edges = new patricia_list<S, patricia_node<T,S>*>(s,n);
 		}
-		nEdges++;
 	}
 };
 
@@ -84,17 +87,18 @@ void warnCycle() {
 	printf("BREAK - CYCLE DETECTED\n");
 }
 
-template<typename T>
+template<typename T, typename S=std::string>
 struct patricia_trie {
-	typedef patricia_list<std::string, patricia_node<T>*>* edgelist;
-	patricia_node<T>* root;
+	typedef patricia_node<T, S> node_type;
+	typedef patricia_list<S, node_type*>* edgelist;
+	node_type* root;
 
-	bool isPrefix(std::string pfx, std::string val) {
+	bool isPrefix(S pfx, S val) {
 		return countCommonPrefix(pfx,val) == pfx.length();
 	}
 
-	int countCommonPrefix(std::string pfx, std::string val) {
-		std::string::iterator i,j;
+	int countCommonPrefix(S pfx, S val) {
+		typename S::iterator i,j;
 		int n = 0;
 		for(i=pfx.begin(),j=val.begin();i != pfx.end();i++,j++,n++)
 			if(*i != *j) return n;
@@ -102,15 +106,25 @@ struct patricia_trie {
 	}
 
 	patricia_trie() {
-		root = new patricia_node<T>();
+		root = new node_type();
 	}
 
 	~patricia_trie() {
 		delete root;
 	}
 
-	T lookup(std::string key, T def) {
-		patricia_node<T>* node = root;
+	void clear() {
+		delete root;
+		root = new node_type();
+	}
+
+	void freePtrs() {
+		// This assumes that T is a pointer type
+		root->freePtrs();
+	}
+
+	T lookup(S key, T def) {
+		node_type* node = root;
 		while(node != NULL) {
 			if(key.empty()) {
 				if(node->hasValue) return node->value;
@@ -134,8 +148,8 @@ struct patricia_trie {
 		return def;
 	}
 
-	void insert(std::string key, T value) {
-		patricia_node<T>* node = root;
+	void insert(S key, T value) {
+		node_type* node = root;
 
 		while(node != NULL) {
 			if(key.empty()) return;
@@ -143,64 +157,63 @@ struct patricia_trie {
 
 			// Select edge
 			edgelist i;
-			bool adjusted = false;
+			bool found_prefix = false;
 			for(i=node->edges;i != NULL;i = i->next) {
 				if(isPrefix(i->first, key)) {
+					// Remove the prefix from the key
 					key.erase(0,i->first.length());
+
+					// Traverse to the child and mark that we did
 					node = i->second;
-					adjusted = true;
+					found_prefix = true;
 					break;
 				}
 			}
-			if(!adjusted) break;
+			if(!found_prefix) break;
+		}
+		if(node == NULL) {
+			printf("\n\aFUCK IT!\n");
+			return;
 		}
 
 		// We hit a dead end. Search for common prefixes in the outgoing edges
 		edgelist i;
-		patricia_node<T>* newNode = new patricia_node<T>(value);
+		node_type* newNode = new node_type(value);
 		int common;
 		for(i=node->edges;i != NULL;i = i->next) {
-			if((common = countCommonPrefix(i->first, key)) > 0) {
-				// Initial state
-				// [A]
-				//  | prefix
-				//  V
-				// [B]
-				
-				// After state
-				// [A]
-				//  | prefix
-				//  V
-				// [C] middle node
-				//  |---\
-				//  V   V
-				// [B] [D]
-				
-				// A = node
-				// B = i->second
-				// C = middleNode
-				// D = newNode
-				
-				// Add a node in the middle
-				std::string remainder = i->first.substr(common);
-				std::string newEdge = key.substr(common);
-				std::string newStarting = i->first.substr(0,common);
+			// Check if this outgoing edge shares a common prefix with the key
+			common = countCommonPrefix(i->first, key);
 
-				// Check whether the remaining prefix would be empty, and
-				// if not, then insert a middle node. Otherwise,
-				// just attach the new nodes to the starting
-				// node, and rewrite the edge name
-				if(newStarting.empty()) {
-					i->first = remainder;
-					node->appendEdge(newEdge, newNode);
+			if(common > 0) {
+				// It does. Get the suffix of the existing edge, the prefix, and
+				// the suffix of the key.
+				S existing_suffix = i->first.substr(common);
+				S key_suffix = key.substr(common);
+				S prefix = i->first.substr(0,common);
+
+				// If the key is a substring of the existing edge, then just
+				// split the edge and make the current target a child of the new
+				// node. Otherwise, create a new node with no value to go
+				// between the prefix and suffixes
+				if(key_suffix.empty()) {
+					// Create a new outgoing edge
+					newNode->appendEdge(existing_suffix, i->second);
+
+					// Adjust the existing edge
+					i->first = prefix;
+					i->second = newNode;
 				} else {
-					// It's not empty, so just clip it and attach
-					// new nodes to an intermediary
-					i->first = i->first.substr(0,common);
-					patricia_node<T>* middleNode = new patricia_node<T>();
-					middleNode->appendEdge(newEdge, newNode);
-					middleNode->appendEdge(remainder, i->second);
-					i->second = middleNode;
+					// Create an intermediate node
+					node_type* middle_node = new node_type();
+					node_type* existing_node = i->second;
+
+					// Add it after the prefix
+					i->first = prefix;
+					i->second = middle_node;
+
+					// Add the two targets as its children
+					middle_node->appendEdge(existing_suffix, existing_node);
+					middle_node->appendEdge(key_suffix, newNode);
 				}
 				return;
 			}
@@ -214,3 +227,6 @@ struct patricia_trie {
 		root->print();
 	}
 };
+
+typedef patricia_trie<uint32_t> ui32patricia; 
+typedef patricia_trie<uint32_t, std::wstring> wui32patricia; 

@@ -6,8 +6,10 @@
 #include <stdexcept>
 #include <map>
 #include <list>
+#include <vector>
 #include <string>
 #include <algorithm>
+#include <locale>
 
 #include <libxml/xmlreader.h>
 #include <boost/iostreams/filtering_streambuf.hpp>
@@ -20,6 +22,7 @@
 #include "rbt.hpp"
 #include "bytes.hpp"
 #include "strtree.hpp"
+#include "patricia.hpp"
 
 using namespace std;
 namespace io = boost::iostreams;
@@ -33,13 +36,19 @@ struct parse_frame {
 	}
 };
 
+// Link structure during streaming processing
+struct streaming_link {
+	uint32_t target;
+	bool redirect;
+};
+
 struct result_target {
 	FILE *f_ids, *f_names, *f_links;
-	strtree idTree;
-	map<uint32_t, uint32_t> offsetMap;
-	map<string, list<uint32_t> > unresolved;
+	ui32patricia idTree;
+	patricia_trie<vector<streaming_link>*> relocate;
 	map<uint32_t, list<uint32_t> > links;
-	uint32_t currentID, n_unresolved;
+	map<uint32_t, size_t> offsetMap; // File offsets of name info
+	uint32_t currentID;
 };
 
 void tolower(char* s) {
@@ -50,62 +59,90 @@ void processFrame(parse_frame& frame, result_target& out) {
 	using namespace boost;
 	uint32_t ident = ++out.currentID;
 	if(frame.content == NULL || frame.title == NULL) {
-		printf("\nWarning: Found page with null frame/content\n");
+		if(frame.title != NULL && frame.content == NULL)
+			printf("\nWarning: page '%s' has null content\n", frame.title);
+		else if(frame.title == NULL && frame.content != NULL)
+			printf("\nWarning: page has null title\n");
+		else
+			printf("\nWarning: page has null frame and content\n");
 		fflush(stdout);
 		return;
 	}
-	printf("\rProcessing pages [%8d|%8d]: %120s", out.currentID,
-			out.n_unresolved, frame.title);
+	if(out.currentID % 64 == 0)
+		printf("\rProcessing pages [%8d]: %120s", out.currentID, frame.title);
 	string tstr((const char*)frame.title);
 
 	// Write the name
 	out.offsetMap[ident] = ftell(out.f_names);
 	fwrite(frame.title, 1, xmlStrlen(frame.title), out.f_names);
+	char null = 0;
+	fwrite(&null, 1, 1, out.f_names);
 
 	// Save the title in the ID buffer
-	out.idTree.set(frame.title, ident);
+	out.idTree.insert((const char*)(frame.title), ident);
 
-	// Resolve links
-	map<string, list<uint32_t> >::iterator itr;
-	itr = out.unresolved.find(tstr);
-	if(itr != out.unresolved.end()) {
-		list<uint32_t>& l = itr->second;
-		for(list<uint32_t>::iterator i=l.begin();i != l.end();i++) {
-			out.links[*i].push_back(ident);
-			out.n_unresolved--;
-		}
-		out.unresolved.erase(itr);
-	}
-
-	// Store unresolved links
+	// Store links
 	string cstr((const char*)frame.content);
 	static const regex linkRE("\\[\\[([^|\\]]+)(\\|[^\\]]+)?\\]\\]",
 			regex::perl);
 	sregex_iterator iter(cstr.begin(), cstr.end(), linkRE);
 	sregex_iterator endIter;
-	list<uint32_t> resolved;
 	for(;iter != endIter;iter++) {
 		sregex_iterator::value_type m = *iter;
-		// Get the name
+		// Get the target
 		const string link = m.str(1);
 
-		// Check if it's already resolved
-		if(out.idTree.has(BAD_CAST link.c_str())) {
-			resolved.push_back(out.idTree.get(BAD_CAST link.c_str()));
-		} else {
-			itr = out.unresolved.find(link);
-			if(itr == out.unresolved.end()) {
-				list<uint32_t> nlist;
-				nlist.push_back(ident);
-				out.unresolved[link] = nlist;
-				out.n_unresolved++;
-			} else {
-				itr->second.push_back(ident);
-				out.n_unresolved++;
-			}
+		vector<streaming_link>* linkList = out.relocate.lookup(link, NULL);
+		if(linkList == NULL) {
+			linkList = new vector<streaming_link>();
+			out.relocate.insert(link, linkList);
 		}
+		streaming_link l;
+		l.target = ident;
+		l.redirect = frame.redirect;
+		linkList->push_back(l);
 	}
-	out.links[ident] = resolved;
+}
+
+void storePatricia(ui32patricia::node_type* node,
+		map<ui32patricia::node_type*, size_t>& relocation, FILE* out) {
+	// Update relocation information
+	size_t begin = ftell(out);
+	map<ui32patricia::node_type*, size_t>::iterator itr = relocation.find(node);
+	if(itr != relocation.end()) {
+		fseek(out, itr->second, SEEK_SET);
+		writeInt32(begin, out);
+		fseek(out, begin, SEEK_SET);
+		relocation.erase(itr);
+	}
+	printf("\rWriting relocation data (%10d)", relocation.size());
+
+	// Write the value, if present
+	char hasValue = node->hasValue ? 1 : 0;
+	fwrite(&hasValue, 1, 1, out);
+	if(node->hasValue) writeInt32(node->value, out);
+
+	// Count the edge list length and store it
+	uint16_t numEdges = 0;
+	for(ui32patricia::edgelist e=node->edges;e != NULL;e=e->next) numEdges++;
+
+	writeInt16(numEdges, out);
+
+	// Write placeholders for each subnode
+	size_t phBase = ftell(out);
+	for(ui32patricia::edgelist e=node->edges;e != NULL;e=e->next) {
+		// Write the name
+		writeInt16(e->first.length(), out);
+		fwrite(e->first.c_str(), 1, e->first.length(), out);
+
+		// And the offset
+		relocation.insert(make_pair(e->second, ftell(out)));
+		writeInt32(0, out);
+	}
+
+	// Write subnodes
+	for(ui32patricia::edgelist e=node->edges;e != NULL;e=e->next)
+		storePatricia(e->second, relocation, out);
 }
 
 int boost_stream_read_callback(void* ctx, char* buf, int len) {
@@ -165,9 +202,8 @@ int main(int argc, char **argv) {
 	bool parsing_frame = false;
 
 	target.currentID = 0;
-	target.n_unresolved = 0;
 	int ret;
-	while((ret = xmlTextReaderRead(reader)) == 1 && target.currentID < 60000) {
+	while((ret = xmlTextReaderRead(reader)) == 1) {
 		// Process a node and print it
 		const xmlChar* localname = xmlTextReaderConstLocalName(reader);
 		int nodeType = xmlTextReaderNodeType(reader);
@@ -205,6 +241,12 @@ int main(int argc, char **argv) {
 			active_frame.content = xmlTextReaderReadString(reader);
 		}
 	}
+	printf("\nParsing complete\n");
+
+	// Now that link and name mappings are done, postprocess the link maps into
+	// their final form
+	map<ui32patricia::node_type*, size_t> relocationTable;
+	storePatricia(target.idTree.root, relocationTable, target.f_ids);
 
 	xmlCleanupParser();
 	return 0;
